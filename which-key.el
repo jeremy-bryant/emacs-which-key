@@ -708,6 +708,15 @@ execution of a command, as in
 \(let \(\(which-key-inhibit t\)\)
 ...\)")
 
+(defcustom which-key-inhibit-display-hook nil
+  "Hook run before display of which-key popup.
+Each function in the hook is run before displaying the which-key
+popup. If any function returns a non-nil value, the popup will
+not display."
+  :group 'which-key
+  :type 'hook
+  :version "1.0")
+
 (defvar which-key-keymap-history nil
   "History of keymap selections.
 Used in functions like `which-key-show-keymap'.")
@@ -715,26 +724,24 @@ Used in functions like `which-key-show-keymap'.")
 ;;; Internal Vars
 
 (defvar which-key--buffer nil
-  "Internal: Holds reference to which-key buffer.")
+  "Holds reference to which-key buffer.")
 (defvar which-key--timer nil
-  "Internal: Holds reference to open window timer.")
+  "Holds reference to open window timer.")
 (defvar which-key--secondary-timer-active nil
-  "Internal: Non-nil if the secondary timer is active.")
+  "Non-nil if the secondary timer is active.")
 (defvar which-key--paging-timer nil
-  "Internal: Holds reference to timer for paging.")
+  "Holds reference to timer for paging.")
 (defvar which-key--frame nil
-  "Internal: Holds reference to which-key frame.
+  "Holds reference to which-key frame.
 Used when `which-key-popup-type' is frame.")
 (defvar which-key--echo-keystrokes-backup nil
-  "Internal: Backup the initial value of `echo-keystrokes'.")
+  "Backup the initial value of `echo-keystrokes'.")
 (defvar which-key--prefix-help-cmd-backup nil
-  "Internal: Backup the value of `prefix-help-command'.")
+  "Backup the value of `prefix-help-command'.")
 (defvar which-key--last-try-2-loc nil
-  "Internal: Last location of side-window when two locations
-used.")
+  "Last location of side-window when two locations used.")
 (defvar which-key--automatic-display nil
-  "Internal: Non-nil if popup was triggered with automatic
-update.")
+  "Non-nil if popup was triggered with automatic update.")
 (defvar which-key--debug-buffer-name nil
   "If non-nil, use this buffer for debug messages.")
 (defvar which-key--multiple-locations nil)
@@ -824,6 +831,27 @@ should be formatted as an input for `kbd'."
           result)))))
 
 ;;; Third-party library support
+
+(defun which-key--this-command-keys ()
+  "Version of `this-single-command-keys' corrected for key-chords."
+  (let ((this-command-keys (this-single-command-keys)))
+    (when (and (vectorp this-command-keys)
+               (> (length this-command-keys) 0)
+               (eq (aref this-command-keys 0) 'key-chord)
+               (bound-and-true-p key-chord-mode))
+      (setq this-command-keys (this-single-command-raw-keys)))
+    this-command-keys))
+
+(defcustom which-key-this-command-keys-function 'which-key--this-command-keys
+  "Function used to retrieve current key sequence.
+The purpose of allowing this variable to be customized is to
+allow which-key to support packages that insert non-standard
+'keys' into the key sequence being read by emacs."
+  :group 'which-key
+  :type 'function
+  :version "1.0")
+
+
 ;;;; Evil
 
 (defvar evil-state nil)
@@ -847,6 +875,13 @@ invalid keys."
   :type 'boolean
   :version "1.0")
 
+(defun which-key-evil-this-operator-p ()
+  (and which-key-allow-evil-operators
+       (bound-and-true-p evil-this-operator)))
+
+(add-hook 'which-key-inhibit-display-hook
+          'which-key-evil-this-operator-p)
+
 ;;;; God-mode
 
 (defvar which-key--god-mode-support-enabled nil
@@ -862,6 +897,21 @@ invalid keys."
     (when (bound-and-true-p which-key-mode)
       (which-key--hide-popup))))
 
+(defun which-key--god-mode-this-command-keys ()
+  "Version of `this-single-command-keys' corrected for god-mode."
+  (let ((this-command-keys (this-single-command-keys)))
+    (when (and which-key--god-mode-support-enabled
+               (bound-and-true-p god-local-mode)
+               (eq this-command 'god-mode-self-insert))
+      (setq this-command-keys (when which-key--god-mode-key-string
+                                (kbd which-key--god-mode-key-string))))
+    this-command-keys))
+
+(defun which-key-god-mode-self-insert-p ()
+  (and which-key--god-mode-support-enabled
+       (bound-and-true-p god-local-mode)
+       (eq this-command 'god-mode-self-insert)))
+
 (defun which-key-enable-god-mode-support (&optional disable)
   "Enable support for god-mode if non-nil.
 This is experimental, so you need to explicitly opt-in for
@@ -870,10 +920,19 @@ disable support."
   (interactive "P")
   (setq which-key--god-mode-support-enabled (null disable))
   (if disable
-      (advice-remove 'god-mode-lookup-command
-                     #'which-key--god-mode-lookup-command-advice)
+      (progn
+        (advice-remove 'god-mode-lookup-command
+                       #'which-key--god-mode-lookup-command-advice)
+        (setq which-key-this-command-keys-function
+              'which-key--this-command-keys)
+        (remove-hook 'which-key-inhibit-display-hook
+                     'which-key-god-mode-self-insert-p))
     (advice-add 'god-mode-lookup-command :around
-                #'which-key--god-mode-lookup-command-advice)))
+                #'which-key--god-mode-lookup-command-advice)
+    (setq which-key-this-command-keys-function
+          'which-key--god-mode-this-command-keys)
+    (add-hook 'which-key-inhibit-display-hook
+              'which-key-god-mode-self-insert-p)))
 
 ;;; Mode
 
@@ -2473,7 +2532,8 @@ This command is always accessible (from any prefix) if
               which-key-show-early-on-C-h)
          (let ((current-prefix
                 (butlast
-                 (listify-key-sequence (which-key--this-command-keys)))))
+                 (listify-key-sequence
+                  (funcall which-key-this-command-keys-function)))))
            (which-key-reload-key-sequence current-prefix)
            (if which-key-idle-secondary-delay
                (which-key--start-timer which-key-idle-secondary-delay t)
@@ -2694,24 +2754,9 @@ Finally, show the buffer."
      "On prefix \"%s\" which-key took %.0f ms." prefix-desc
      (* 1000 (float-time (time-since start-time))))))
 
-(defun which-key--this-command-keys ()
-  "Version of `this-single-command-keys' corrected for key-chords and god-mode."
-  (let ((this-command-keys (this-single-command-keys)))
-    (when (and (vectorp this-command-keys)
-               (> (length this-command-keys) 0)
-               (eq (aref this-command-keys 0) 'key-chord)
-               (bound-and-true-p key-chord-mode))
-      (setq this-command-keys (this-single-command-raw-keys)))
-    (when (and which-key--god-mode-support-enabled
-               (bound-and-true-p god-local-mode)
-               (eq this-command 'god-mode-self-insert))
-      (setq this-command-keys (when which-key--god-mode-key-string
-                                (kbd which-key--god-mode-key-string))))
-    this-command-keys))
-
 (defun which-key--update ()
   "Function run by timer to possibly trigger `which-key--create-buffer-and-show'."
-  (let ((prefix-keys (which-key--this-command-keys))
+  (let ((prefix-keys (funcall which-key-this-command-keys-function))
         delay-time)
     (cond ((and (> (length prefix-keys) 0)
                 (or (keymapp (key-binding prefix-keys))
@@ -2731,11 +2776,8 @@ Finally, show the buffer."
                       which-key-inhibit-regexps (key-description prefix-keys))))
                 ;; Do not display the popup if a command is currently being
                 ;; executed
-                (or (and which-key-allow-evil-operators
-                         (bound-and-true-p evil-this-operator))
-                    (and which-key--god-mode-support-enabled
-                         (bound-and-true-p god-local-mode)
-                         (eq this-command 'god-mode-self-insert))
+                (or (run-hook-with-args-until-success
+                     'which-key-inhibit-display-hook)
                     (null this-command))
                 (let ((max-dim (which-key--popup-max-dimensions)))
                   (> (min (car-safe max-dim) (cdr-safe max-dim)) 0)))
@@ -2795,7 +2837,7 @@ Finally, show the buffer."
                                         which-key--paging-functions))
                            (and (< 0 (length (this-single-command-keys)))
                                 (not (equal (which-key--current-prefix)
-                                            (which-key--this-command-keys)))))
+                                            (funcall which-key-this-command-keys-function)))))
                    (cancel-timer which-key--paging-timer)
                    (if which-key-idle-secondary-delay
                        ;; we haven't executed a command yet so the secandary
